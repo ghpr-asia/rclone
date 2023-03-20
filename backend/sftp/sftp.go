@@ -197,6 +197,11 @@ E.g. if home directory can be found in a shared folder called "home":
 			Help:     "The command used to read md5 hashes.\n\nLeave blank for autodetect.",
 			Advanced: true,
 		}, {
+			Name:     "proxy_jump",
+			Default:  "",
+			Help:     "String of hosts used similar to `ssh -J`.",
+			Advanced: true,
+		}, {
 			Name:     "sha1sum_command",
 			Default:  "",
 			Help:     "The command used to read sha1 hashes.\n\nLeave blank for autodetect.",
@@ -393,6 +398,7 @@ type Options struct {
 	SetModTime              bool            `config:"set_modtime"`
 	ShellType               string          `config:"shell_type"`
 	Md5sumCommand           string          `config:"md5sum_command"`
+	ProxyJump               string          `config:"proxy_jump"`
 	Sha1sumCommand          string          `config:"sha1sum_command"`
 	SkipLinks               bool            `config:"skip_links"`
 	Subsystem               string          `config:"subsystem"`
@@ -416,6 +422,7 @@ type Fs struct {
 	absRoot      string
 	shellRoot    string
 	shellType    string
+	jumpHosts    []JumpHost
 	opt          Options          // parsed options
 	ci           *fs.ConfigInfo   // global config
 	m            configmap.Mapper // config
@@ -448,6 +455,30 @@ type Object struct {
 // initiates the SSH handshake, and then sets up a Client.
 func (f *Fs) dial(ctx context.Context, network, addr string, sshConfig *ssh.ClientConfig) (*ssh.Client, error) {
 	dialer := fshttp.NewDialer(ctx)
+	if len(f.jumpHosts) > 0 {
+		conn, err := dialer.Dial(f.jumpHosts[0].Addr.AddrNetwork, f.jumpHosts[0].Addr.Addr)
+		if err != nil {
+			return nil, err
+		}
+		// it's a hack so only support 1 jumphost but can do more if required
+		c, chans, reqs, err := ssh.NewClientConn(conn, f.jumpHosts[0].Addr.Addr, sshConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to connect to JumpHost %s\n%w\n", f.jumpHosts[0].Addr, err)
+		}
+		jhconn := ssh.NewClient(c, chans, reqs)
+		//defer jhconn.Close()
+
+		rconn, err := jhconn.Dial(f.jumpHosts[0].Addr.AddrNetwork, f.opt.Host+":"+f.opt.Port)
+		if err != nil {
+			return nil, fmt.Errorf("from JumpHost failed to connect to %s\n%w\n", f.opt.Host+":"+f.opt.Port, err)
+		}
+		//defer rconn.Close()
+		rc, rchans, rreqs, err := ssh.NewClientConn(rconn, f.opt.Host+":"+f.opt.Port, sshConfig)
+		if err != nil {
+			return nil, fmt.Errorf("from JumpHost connected, but failed to authenticate to %s\n%w\n", f.opt.Host+":"+f.opt.Port, err)
+		}
+		return ssh.NewClient(rc, rchans, rreqs), nil
+	}
 	conn, err := dialer.Dial(network, addr)
 	if err != nil {
 		return nil, err
@@ -770,7 +801,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	keyFile := env.ShellExpand(opt.KeyFile)
 	pubkeyFile := env.ShellExpand(opt.PubKeyFile)
-	//keyPem := env.ShellExpand(opt.KeyPem)
+	// keyPem := env.ShellExpand(opt.KeyPem)
 	// Add ssh agent-auth if no password or file or key PEM specified
 	if (opt.Pass == "" && keyFile == "" && !opt.AskPassword && opt.KeyPem == "") || opt.KeyUseAgent {
 		sshAgentClient, _, err := sshagent.New()
@@ -940,6 +971,11 @@ func NewFsWithConnection(ctx context.Context, f *Fs, name string, root string, m
 	f.opt = *opt
 	f.m = m
 	f.config = sshConfig
+	jh, err := ParseProxyJump(opt.ProxyJump)
+	if err != nil {
+		return nil, err
+	}
+	f.jumpHosts = jh
 	f.url = "sftp://" + opt.User + "@" + opt.Host + ":" + opt.Port + "/" + root
 	f.mkdirLock = newStringLock()
 	f.pacer = fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant)))
@@ -1988,7 +2024,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 			fs.Debugf(o, "Not found after upload with set_modtime=false so returning best guess")
 			o.modTime = src.ModTime(ctx)
 			o.size = src.Size()
-			o.mode = os.FileMode(0666) // regular file
+			o.mode = os.FileMode(0o666) // regular file
 		} else if err != nil {
 			return fmt.Errorf("Update stat failed: %w", err)
 		}
