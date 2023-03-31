@@ -62,7 +62,7 @@ func ParseAddr(a string) (*NetAddr, error) {
 // ParseProxyJump parses strings like user@host:port,bob@host:port
 func ParseProxyJump(in string) ([]JumpHost, error) {
 	if in == "" {
-		return nil, fmt.Errorf("missing proxyjump")
+		return []JumpHost{}, nil
 	}
 	parts := strings.Split(in, ",")
 	out := make([]JumpHost, 0, len(parts))
